@@ -38,7 +38,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define DMA_RX_BUFFER_SIZE 256
+#define GPS_PROCESS_BUFFER_SIZE 256
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,6 +52,7 @@ SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
 
 UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
 volatile uint32_t dhcp_tick_cnt = 0;
@@ -58,6 +60,16 @@ uint8_t chip_ver_g;
 Screen ILI9341_Screen;
 
 uint8_t is_websocket_active = 0;
+
+uint8_t g_dma_rx_buffer[DMA_RX_BUFFER_SIZE];
+uint8_t g_gps_process_buffer[GPS_PROCESS_BUFFER_SIZE];
+volatile uint8_t g_gps_data_ready = 0;
+volatile uint16_t g_gps_data_size = 0;
+
+int32_t lat_e5 = 0; // Широта * 100000
+int32_t lon_e5 = 0; // Довгота * 100000
+uint8_t sats_view = 0;
+uint8_t fix_status = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -77,6 +89,34 @@ void Timer_Callback_1s(void) {
     DHCP_time_handler();
 }
 
+
+// “GPS”
+
+uint32_t tick_tlm  = 0;
+uint32_t tick_hb   = 0;
+uint32_t tick_cmd  = 0;
+
+static uint8_t cmd_seq = 0;
+
+
+uint8_t crc8(const uint8_t *data, uint8_t len)
+{
+    uint8_t crc = 0x00;
+    const uint8_t poly = 0x07; // x^8 + x^2 + x + 1
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+        for (uint8_t b = 0; b < 8; b++)
+        {
+            if (crc & 0x80)
+                crc = (crc << 1) ^ poly;
+            else
+                crc <<= 1;
+        }
+    }
+    return crc;
+}
 /* USER CODE END 0 */
 
 /**
@@ -108,12 +148,17 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_SPI1_Init();
+  MX_USART2_UART_Init();
   MX_USART1_UART_Init();
   MX_SPI2_Init();
 
 
   /* USER CODE BEGIN 2 */
+  if(HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_dma_rx_buffer, DMA_RX_BUFFER_SIZE) != HAL_OK) {
+	  Error_Handler();
+  }
 
   ILI9341_init(&hspi2);
 
@@ -154,6 +199,55 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  if (g_gps_data_ready) {
+	  	          char* line = strtok((char*)g_gps_process_buffer, "\r\n");
+
+	  	          while (line != NULL)
+	  	          {
+	  	              // Шукаємо рядки GNGGA або GPGGA
+	  	              if (strncmp(line, "$GNGGA", 6) == 0 || strncmp(line, "$GPGGA", 6) == 0) {
+	  	                  float nmea_time, nmea_lat, nmea_lon, altitude;
+	  	                  char lat_dir, lon_dir;
+	  	                  int fix_quality, num_sats;
+
+	  	                  // Знаходимо початок даних (після коми)
+	  	                  const char* data_start = strchr(line, ',');
+	  	                  if (data_start) {
+	  	                      // Парсимо рядок
+	  	                      int items = sscanf(data_start + 1, "%f,%f,%c,%f,%c,%d,%d,%*f,%f,",
+	  	                                         &nmea_time, &nmea_lat, &lat_dir, &nmea_lon, &lon_dir,
+	  	                                         &fix_quality, &num_sats, &altitude);
+
+	  	                      if (items >= 7 && fix_quality > 0) {
+	  	                          // 1. Конвертуємо координати з формату NMEA (ddmm.mmmm) в десяткові градуси (dd.ddddd)
+	  	                          int lat_deg_int = (int)(nmea_lat / 100);
+	  	                          float lat_min = nmea_lat - (lat_deg_int * 100);
+	  	                          float lat_decimal = lat_deg_int + (lat_min / 60.0f);
+	  	                          if (lat_dir == 'S') lat_decimal = -lat_decimal;
+
+	  	                          int lon_deg_int = (int)(nmea_lon / 100);
+	  	                          float lon_min = nmea_lon - (lon_deg_int * 100);
+	  	                          float lon_decimal = lon_deg_int + (lon_min / 60.0f);
+	  	                          if (lon_dir == 'W') lon_decimal = -lon_decimal;
+
+	  	                          // 2. Оновлюємо глобальні змінні для CAN (формат: * 100000)
+	  	                          lat_e5 = (int32_t)(lat_decimal * 100000.0f);
+	  	                          lon_e5 = (int32_t)(lon_decimal * 100000.0f);
+	  	                          sats_view = (uint8_t)num_sats;
+	  	                          fix_status = (uint8_t)fix_quality; // 1 = GPS fix, 2 = DGPS fix
+	  	                      } else {
+	  	                           // Якщо фіксу немає, можна слати нулі або статус помилки
+	  	                           fix_status = 0;
+	  	                      }
+	  	                  }
+	  	              }
+	  	              line = strtok(NULL, "\r\n"); // Наступний рядок
+	  	          }
+	  	          g_gps_data_ready = 0;
+	  	      }
+	  	  uint32_t now = HAL_GetTick();
+
+
 	  wiz_NetInfo cur_net_info;
 
 	  wizchip_getnetinfo(&cur_net_info);
