@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -38,8 +39,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define DMA_RX_BUFFER_SIZE 256
-#define GPS_PROCESS_BUFFER_SIZE 256
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,7 +52,6 @@ SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
 
 UART_HandleTypeDef huart1;
-DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
 volatile uint32_t dhcp_tick_cnt = 0;
@@ -60,16 +59,6 @@ uint8_t chip_ver_g;
 Screen ILI9341_Screen;
 
 uint8_t is_websocket_active = 0;
-
-uint8_t g_dma_rx_buffer[DMA_RX_BUFFER_SIZE];
-uint8_t g_gps_process_buffer[GPS_PROCESS_BUFFER_SIZE];
-volatile uint8_t g_gps_data_ready = 0;
-volatile uint16_t g_gps_data_size = 0;
-
-int32_t lat_e5 = 0; // Широта * 100000
-int32_t lon_e5 = 0; // Довгота * 100000
-uint8_t sats_view = 0;
-uint8_t fix_status = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -89,34 +78,6 @@ void Timer_Callback_1s(void) {
     DHCP_time_handler();
 }
 
-
-// “GPS”
-
-uint32_t tick_tlm  = 0;
-uint32_t tick_hb   = 0;
-uint32_t tick_cmd  = 0;
-
-static uint8_t cmd_seq = 0;
-
-
-uint8_t crc8(const uint8_t *data, uint8_t len)
-{
-    uint8_t crc = 0x00;
-    const uint8_t poly = 0x07; // x^8 + x^2 + x + 1
-
-    for (uint8_t i = 0; i < len; i++)
-    {
-        crc ^= data[i];
-        for (uint8_t b = 0; b < 8; b++)
-        {
-            if (crc & 0x80)
-                crc = (crc << 1) ^ poly;
-            else
-                crc <<= 1;
-        }
-    }
-    return crc;
-}
 /* USER CODE END 0 */
 
 /**
@@ -148,17 +109,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_SPI1_Init();
-  MX_USART2_UART_Init();
   MX_USART1_UART_Init();
   MX_SPI2_Init();
-
-
   /* USER CODE BEGIN 2 */
-  if(HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_dma_rx_buffer, DMA_RX_BUFFER_SIZE) != HAL_OK) {
-	  Error_Handler();
-  }
 
   ILI9341_init(&hspi2);
 
@@ -177,6 +131,11 @@ int main(void)
   W5500_Init();
   Net_Init();
 
+  status_init();
+
+    // Initialize USB CDC device
+  MX_USB_DEVICE_Init();
+
   // --- Start HTTP Server on Socket 1 ---
   uint8_t sock = 1;
 
@@ -191,7 +150,7 @@ int main(void)
       uint8_t sock_llmnr = 2; // <--- 2. Виділяємо окремий сокет для LLMNR (UDP)
       LLMNR_Init(sock_llmnr); // <--- 3. Ініціалізуємо LLMNR
   /* USER CODE END 2 */
-
+      uint32_t last_status_ms = HAL_GetTick();
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
@@ -199,54 +158,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if (g_gps_data_ready) {
-	  	          char* line = strtok((char*)g_gps_process_buffer, "\r\n");
+	  uint32_t now = HAL_GetTick();
 
-	  	          while (line != NULL)
-	  	          {
-	  	              // Шукаємо рядки GNGGA або GPGGA
-	  	              if (strncmp(line, "$GNGGA", 6) == 0 || strncmp(line, "$GPGGA", 6) == 0) {
-	  	                  float nmea_time, nmea_lat, nmea_lon, altitude;
-	  	                  char lat_dir, lon_dir;
-	  	                  int fix_quality, num_sats;
-
-	  	                  // Знаходимо початок даних (після коми)
-	  	                  const char* data_start = strchr(line, ',');
-	  	                  if (data_start) {
-	  	                      // Парсимо рядок
-	  	                      int items = sscanf(data_start + 1, "%f,%f,%c,%f,%c,%d,%d,%*f,%f,",
-	  	                                         &nmea_time, &nmea_lat, &lat_dir, &nmea_lon, &lon_dir,
-	  	                                         &fix_quality, &num_sats, &altitude);
-
-	  	                      if (items >= 7 && fix_quality > 0) {
-	  	                          // 1. Конвертуємо координати з формату NMEA (ddmm.mmmm) в десяткові градуси (dd.ddddd)
-	  	                          int lat_deg_int = (int)(nmea_lat / 100);
-	  	                          float lat_min = nmea_lat - (lat_deg_int * 100);
-	  	                          float lat_decimal = lat_deg_int + (lat_min / 60.0f);
-	  	                          if (lat_dir == 'S') lat_decimal = -lat_decimal;
-
-	  	                          int lon_deg_int = (int)(nmea_lon / 100);
-	  	                          float lon_min = nmea_lon - (lon_deg_int * 100);
-	  	                          float lon_decimal = lon_deg_int + (lon_min / 60.0f);
-	  	                          if (lon_dir == 'W') lon_decimal = -lon_decimal;
-
-	  	                          // 2. Оновлюємо глобальні змінні для CAN (формат: * 100000)
-	  	                          lat_e5 = (int32_t)(lat_decimal * 100000.0f);
-	  	                          lon_e5 = (int32_t)(lon_decimal * 100000.0f);
-	  	                          sats_view = (uint8_t)num_sats;
-	  	                          fix_status = (uint8_t)fix_quality; // 1 = GPS fix, 2 = DGPS fix
-	  	                      } else {
-	  	                           // Якщо фіксу немає, можна слати нулі або статус помилки
-	  	                           fix_status = 0;
-	  	                      }
-	  	                  }
-	  	              }
-	  	              line = strtok(NULL, "\r\n"); // Наступний рядок
-	  	          }
-	  	          g_gps_data_ready = 0;
-	  	      }
-	  	  uint32_t now = HAL_GetTick();
-
+	  if ((now - last_status_ms) >= 1000)
+		{
+			last_status_ms = now;
+			status_update();
+		}
 
 	  wiz_NetInfo cur_net_info;
 
@@ -294,18 +212,14 @@ int main(void)
 			  else if (strstr((char*)buffer, "GET /status") != NULL) {
 
 				  char json[256];
-				  sprintf(json,
-					  "{ \"proto_ver\":1, \"device_id\":\"STM32-411\", "
-					  "\"gps\":{\"lat\":49.0,\"lon\":24.0}, "
-					  "\"env\":{\"t_c\":23.0,\"lux\":400} }"
-				  );
+				  build_status_json(json, sizeof(json));
 
 				  char header[128];
 				  sprintf(header,
 					  "HTTP/1.1 200 OK\r\n"
 					  "Content-Type: application/json\r\n"
 					  "Content-Length: %d\r\n\r\n",
-					  strlen(json)
+					  (int)strlen(json)
 				  );
 
 				  send(sock, (uint8_t *)header, strlen(header));
@@ -380,33 +294,44 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
+  /* Увімкнути живлення і виставити шкалу напруги */
   __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  /* Налаштовуємо осцилятори: HSE + PLL */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+
+  /* HSE=8MHz:
+   * PLLM = 8   → VCO_IN = 1 MHz
+   * PLLN = 336 → VCO_OUT = 336 MHz
+   * PLLP = 4   → SYSCLK = 84 MHz
+   * PLLQ = 7   → 336/7 = 48 MHz для USB
+   */
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV2;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  /* Шини */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK |
+                                RCC_CLOCKTYPE_SYSCLK |
+                                RCC_CLOCKTYPE_PCLK1 |
+                                RCC_CLOCKTYPE_PCLK2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;  // 84 MHz
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;         // HCLK = 84 MHz
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;          // PCLK1 = 42 MHz
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;          // PCLK2 = 84 MHz
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
   {
     Error_Handler();
   }
